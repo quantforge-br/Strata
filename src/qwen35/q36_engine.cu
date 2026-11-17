@@ -1159,15 +1159,18 @@ bool load(const std::string& path, const std::string& mtp_path, Model& m, std::s
                 err = "--mtp-gguf is missing " + name;
                 return false;
             }
-            if (t->shape.size() != want.shape.size()) {
+            // llama.cpp's standalone MTP conversion writes the one-column shared gate as [N, 1], while the
+            // in-file layout uses the equivalent one-dimensional [N] form.  Accept that harmless singleton here.
+            const bool singleton_vector = want.shape.size() == 1 && t->shape.size() == 2 && t->shape[1] == 1 &&
+                                          t->shape[0] == (uint64_t) want.shape[0];
+            if (!singleton_vector && t->shape.size() != want.shape.size()) {
                 err = name + " has the wrong rank in --mtp-gguf";
                 return false;
             }
-            for (size_t i = 0; i < want.shape.size(); ++i)
-                if (t->shape[i] != (uint64_t) want.shape[i]) {
+            if ((!singleton_vector && t->shape.size() == want.shape.size()) && t->shape[0] != (uint64_t) want.shape[0]) {
                     err = name + " has the wrong shape in --mtp-gguf";
                     return false;
-                }
+            }
             if (!mm.in_bounds(*t, s)) {
                 err = name + " has no known size inside --mtp-gguf";
                 return false;
