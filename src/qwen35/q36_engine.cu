@@ -3304,10 +3304,14 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         H.score.assign((size_t) ne, 0.0);
         CK(cudaMalloc(&H.slot_of_d, (size_t) ne * 4));
         CK(cudaMemcpy(H.slot_of_d, H.slot_of.data(), (size_t) ne * 4, cudaMemcpyHostToDevice));
-        if (!C::native_fmt(L.L.gu_type, L.L.d_type, g.n_embd, g.n_ff, H.fmt, err)) return false;
-        if (H.fmt.up_off != L.L.up_off || H.fmt.down_off != L.L.down_off || H.fmt.bytes != L.L.bytes) {
-            err = "the CPU and GPU expert layouts differ";
-            return false;
+        // MMQ-only pairs never enter the CPU native expert pool: their hybrid decode and prompt paths stream the
+        // blobs through MMQ on the GPU.  Do not ask ggml-cpu to describe an activation format it cannot represent.
+        if (L.native_grouped) {
+            if (!C::native_fmt(L.L.gu_type, L.L.d_type, g.n_embd, g.n_ff, H.fmt, err)) return false;
+            if (H.fmt.up_off != L.L.up_off || H.fmt.down_off != L.L.down_off || H.fmt.bytes != L.L.bytes) {
+                err = "the CPU and GPU expert layouts differ";
+                return false;
+            }
         }
     }
     const size_t T = (size_t) E.tmax, N = (size_t) g.n_embd, Kp = (size_t) m.top_k;
