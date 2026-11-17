@@ -60,6 +60,7 @@
 #include <memory>
 #include <mutex>
 #include <random>
+#include <set>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -872,6 +873,9 @@ struct Layer {
 struct Model {
     strata::core::ModelGeometry g;
     std::shared_ptr<strata::GgufModel> file;   // kept mapped: the experts are placed after the engine's buffers
+    // An optional MTP-only GGUF (the public Ornith export keeps blk.48 in a separate file).  Keep it mapped for the
+    // lifetime of the engine because the routed expert source pointers below point into its mmap.
+    std::shared_ptr<strata::GgufModel> mtp_file;
     bool hybrid = false;                       // not every expert fits in VRAM: slots + the CPU pool
     // the packed Q8_0 decode copies (gguf weights, packed copy, bytes): given back when that lets every expert fit
     std::vector<std::tuple<const uint8_t*, uint8_t*, size_t>> packed;
@@ -968,7 +972,7 @@ float* upload_f32(const strata::TensorInfo& t, const uint8_t* src) {
     return d;
 }
 
-bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
+bool load(const std::string& path, const std::string& mtp_path, Model& m, std::string& err, bool want_mtp) {
     const auto t0 = Clock::now();
     m.file = std::make_shared<strata::GgufModel>(strata::GgufModel::open(path));
     const strata::GgufModel& gm = *m.file;
@@ -1039,6 +1043,10 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
     // the MTP block whenever the file has one, with or without drafts (--mtp): the VRAM it takes is then the same
     // either way, so the hybrid mode's slot tables - and with them the greedy text - do not depend on --mtp
     (void) want_mtp;
+    if (!mtp_path.empty() && g.n_mtp_layers > 0) {
+        err = "--mtp-gguf cannot be combined with a model GGUF that already contains an MTP block";
+        return false;
+    }
     m.has_mtp = g.n_mtp_layers > 0;
     for (int64_t l = 0; l < g.n_layers + (m.has_mtp ? 1 : 0); ++l) {
         const bool is_mtp = l == g.n_layers;
@@ -1110,6 +1118,161 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
         m.mtp_enorm = f32(L(l, "nextn.enorm.weight"));
         m.mtp_hnorm = f32(L(l, "nextn.hnorm.weight"));
         m.mtp_shnorm = f32(L(l, "nextn.shared_head_norm.weight"));
+    }
+    if (!mtp_path.empty()) {
+        // External MTP exports carry only blk.<block_count-1>.* and the four nextn.* tensors.  They still contain
+        // complete qwen35moe geometry metadata, so validate that geometry against the trunk before loading the block.
+        try {
+            m.mtp_file = std::make_shared<strata::GgufModel>(strata::GgufModel::open(mtp_path));
+        } catch (const std::exception& e) {
+            err = std::string("cannot open --mtp-gguf: ") + e.what();
+            return false;
+        }
+        const strata::GgufModel& mm = *m.mtp_file;
+        strata::core::ModelGeometry mg;
+        int64_t mtp_top_k = 0;
+        if (!strata::core::geometry_from_gguf(mm.meta(), mg, mtp_top_k, err)) return false;
+        if (mg.family != strata::ModelFamily::Qwen35Moe || mg.n_mtp_layers != 1 || mg.n_layers != g.n_layers) {
+            err = "--mtp-gguf must be a qwen35moe file with exactly one MTP layer matching the main model";
+            return false;
+        }
+        const auto same = [](int64_t a, int64_t b) { return a == b; };
+        if (!same(mg.n_embd, g.n_embd) || !same(mg.n_head, g.n_head) || !same(mg.n_head_kv, g.n_head_kv) ||
+            !same(mg.head_dim, g.head_dim) || !same(mg.n_expert, g.n_expert) || !same(mg.n_ff, g.n_ff) ||
+            !same(mg.n_ff_shexp, g.n_ff_shexp) || !same(mg.ssm_state_size, g.ssm_state_size) ||
+            !same(mg.ssm_k_heads, g.ssm_k_heads) || !same(mg.ssm_v_heads, g.ssm_v_heads) ||
+            !same(mg.ssm_d_conv, g.ssm_d_conv) || !same(mg.ssm_value_dim, g.ssm_value_dim) ||
+            !same(mg.qsa_interval, g.qsa_interval) || !same(mg.n_vocab, g.n_vocab) || mtp_top_k != m.top_k) {
+            err = "--mtp-gguf geometry does not match the main model";
+            return false;
+        }
+        const int64_t l = g.n_layers;
+        // The external artifact intentionally has no globals, but its one layer must still be the complete MTP layout.
+        // Check names, shapes and bounds here instead of running the full-model layout checker (which would require
+        // token_embd/output tensors that an MTP-only file does not carry).
+        std::set<std::string> mtp_named;
+        for (const strata::core::TensorWant& want : strata::core::layer_tensors(mg, l)) {
+            const std::string name = "blk." + std::to_string(l) + "." + want.name;
+            size_t s = 0;
+            const strata::TensorInfo* t = mm.find(name, &s);
+            if (!t) {
+                err = "--mtp-gguf is missing " + name;
+                return false;
+            }
+            if (t->shape.size() != want.shape.size()) {
+                err = name + " has the wrong rank in --mtp-gguf";
+                return false;
+            }
+            for (size_t i = 0; i < want.shape.size(); ++i)
+                if (t->shape[i] != (uint64_t) want.shape[i]) {
+                    err = name + " has the wrong shape in --mtp-gguf";
+                    return false;
+                }
+            if (!mm.in_bounds(*t, s)) {
+                err = name + " has no known size inside --mtp-gguf";
+                return false;
+            }
+            mtp_named.insert(name);
+        }
+        for (size_t s = 0; s < mm.size(); ++s)
+            for (const strata::TensorInfo& t : mm.shard(s).tensors())
+                if (!mtp_named.count(t.name)) {
+                    err = t.name + " is not part of the external MTP block";
+                    return false;
+                }
+        auto mfind = [&](const std::string& name, size_t& s) -> const strata::TensorInfo* {
+            const strata::TensorInfo* t = mm.find(name, &s);
+            if (!t) {
+                err = "--mtp-gguf is missing " + name;
+                return nullptr;
+            }
+            if (!mm.in_bounds(*t, s)) {
+                err = name + " in --mtp-gguf has no known size inside its shard";
+                return nullptr;
+            }
+            return t;
+        };
+        auto mf32 = [&](const std::string& name) -> const float* {
+            size_t s = 0;
+            const strata::TensorInfo* t = mfind(name, s);
+            if (!t) return nullptr;
+            bytes += t->elements() * 4;
+            return upload_f32(*t, mm.shard(s).tensor_data(*t));
+        };
+        auto mmat = [&](const std::string& name) -> Mat {
+            size_t s = 0;
+            const strata::TensorInfo* t = mfind(name, s);
+            Mat w;
+            if (!t) return w;
+            w.type = (int) t->type;
+            w.n_in = (int) t->shape[0];
+            w.n_out = (int) t->shape[1];
+            if (!K::native_mmvq_supported(w.type)) {
+                err = name + " in --mtp-gguf is " + t->type_name() + ", which the native MMVQ does not take";
+                return {};
+            }
+            const uint64_t nb = strata::tensor_payload_bytes(*t);
+            uint8_t* d = nullptr;
+            CK(cudaMalloc(&d, nb));
+            CK(cudaMemcpy(d, mm.shard(s).tensor_data(*t), nb, cudaMemcpyHostToDevice));
+            bytes += nb;
+            w.d = d;
+            return w;
+        };
+        Layer& y = m.mtp;
+        y.attn = true;
+        y.attn_norm = mf32(L(l, "attn_norm.weight"));
+        y.post_norm = mf32(L(l, "post_attention_norm.weight"));
+        y.wq = mmat(L(l, "attn_q.weight"));
+        y.wk = mmat(L(l, "attn_k.weight"));
+        y.wv = mmat(L(l, "attn_v.weight"));
+        y.wo = mmat(L(l, "attn_output.weight"));
+        y.q_norm = mf32(L(l, "attn_q_norm.weight"));
+        y.k_norm = mf32(L(l, "attn_k_norm.weight"));
+        y.router = mf32(L(l, "ffn_gate_inp.weight"));
+        y.sh_gate = mmat(L(l, "ffn_gate_shexp.weight"));
+        y.sh_up = mmat(L(l, "ffn_up_shexp.weight"));
+        y.sh_down = mmat(L(l, "ffn_down_shexp.weight"));
+        y.sh_gate_inp = mf32(L(l, "ffn_gate_inp_shexp.weight"));
+        CK(cudaMalloc(&y.router_ext, (size_t) (g.n_expert + 1) * g.n_embd * 4));
+        CK(cudaMemcpy(y.router_ext, y.router, (size_t) g.n_expert * g.n_embd * 4, cudaMemcpyDeviceToDevice));
+        CK(cudaMemcpy(y.router_ext + (size_t) g.n_expert * g.n_embd, y.sh_gate_inp, (size_t) g.n_embd * 4,
+                      cudaMemcpyDeviceToDevice));
+        bytes += (size_t) (g.n_expert + 1) * g.n_embd * 4;
+        size_t sg = 0, su = 0, sd = 0;
+        const strata::TensorInfo* tg = mfind(L(l, "ffn_gate_exps.weight"), sg);
+        const strata::TensorInfo* tu = mfind(L(l, "ffn_up_exps.weight"), su);
+        const strata::TensorInfo* td = mfind(L(l, "ffn_down_exps.weight"), sd);
+        if (!tg || !tu || !td) return false;
+        if (tg->type != tu->type) {
+            err = "--mtp-gguf gate/up expert tensor types differ";
+            return false;
+        }
+        const bool native_ok = K::native_expert_supported((int) tg->type, (int) td->type, g.n_embd, g.n_ff);
+        const bool mmq_ok = MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr &&
+                            MMQ::supported((int) tg->type) && MMQ::supported((int) td->type) &&
+                            MMQ::fits((int) tg->type, 2 * g.n_ff) && MMQ::fits((int) td->type, g.n_embd);
+        if (!native_ok && !mmq_ok) {
+            err = std::string("--mtp-gguf experts are ") + tg->type_name() + "/" + td->type_name() +
+                  ", which neither the native grouped nor the MMQ expert kernels take";
+            return false;
+        }
+        y.native_grouped = native_ok;
+        y.L = K::native_expert_layout((int) tg->type, (int) td->type, g.n_embd, g.n_ff);
+        const size_t gsz = (size_t) g.n_ff * y.L.gu_row, dsz = (size_t) g.n_embd * y.L.d_row;
+        const size_t al = lcm_sz(lcm_sz(block_bytes(y.L.gu_type), block_bytes(y.L.d_type)), 16);
+        y.stride = (y.L.bytes + al - 1) / al * al;
+        y.src_g = mm.shard(sg).tensor_data(*tg);
+        y.src_u = mm.shard(su).tensor_data(*tu);
+        y.src_d = mm.shard(sd).tensor_data(*td);
+        y.src_gsz = gsz;
+        y.src_dsz = dsz;
+        m.eh_proj = mmat(L(l, "nextn.eh_proj.weight"));
+        m.mtp_enorm = mf32(L(l, "nextn.enorm.weight"));
+        m.mtp_hnorm = mf32(L(l, "nextn.hnorm.weight"));
+        m.mtp_shnorm = mf32(L(l, "nextn.shared_head_norm.weight"));
+        m.has_mtp = true;
+        std::fprintf(stderr, "strata-q36: loaded external MTP block %s (1 layer)\n", mtp_path.c_str());
     }
     m.out_norm = f32("output_norm.weight");
     m.head = mat("output.weight");
@@ -3894,7 +4057,7 @@ int serve(Engine& E) {
 }  // namespace
 
 int strata::qwen35::run(int argc, char** argv) {
-    std::string model, tokens, force, dump_full, emb_file;
+    std::string model, mtp_gguf, tokens, force, dump_full, emb_file;
     int ctx = 32768, chunk = 0, n_gen = 64, bench_pp = 0, bench_tg = 0, mtp_d = 0, cpu_threads = 0, hybrid_rows = 128;
     double expert_vram = -1.0;
     bool warm = true;
@@ -3932,6 +4095,7 @@ int strata::qwen35::run(int argc, char** argv) {
             else std::fprintf(stderr, "strata-q36: ignoring --mtp %s (this family's MTP is the GGUF's own block: --mtp N "
                                       "drafts)\n", v.c_str());
         }
+        else if (a == "--mtp-gguf") mtp_gguf = next();
         else if (a == "--draft-vocab") draft_vocab = std::atoi(next().c_str());   // the MTP drafts pick among the first N token ids
         else if (a == "--vision") vision = true;                                  // pictures (GENI): the encoder is strata-vision's
         else if (a == "--batch" || a == "--slots") batch = std::atoi(next().c_str());   // sessions decoding together
@@ -3949,7 +4113,7 @@ int strata::qwen35::run(int argc, char** argv) {
             if (val) ++i;
         } else {
             std::fprintf(stderr,
-                         "usage: strata-q36 --model GGUF [--max-context 32768] [--chunk 512] [--no-graph]\n"
+                         "usage: strata-q36 --model GGUF [--mtp-gguf MTP.gguf] [--max-context 32768] [--chunk 512] [--no-graph]\n"
                          "       (--serve | --tokens IDS [--n 64] [--force IDS] [--dump-full-logits F] | --bench-pp N "
                          "--bench-tg N)\n");
             return 2;
@@ -3994,7 +4158,7 @@ int strata::qwen35::run(int argc, char** argv) {
     Model m;
     std::string err;
     try {
-        if (!load(model, m, err, mtp_d > 0)) { std::fprintf(stderr, "strata-q36: %s\n", err.c_str()); return 1; }
+        if (!load(model, mtp_gguf, m, err, mtp_d > 0)) { std::fprintf(stderr, "strata-q36: %s\n", err.c_str()); return 1; }
     } catch (const std::exception& e) {
         std::fprintf(stderr, "strata-q36: %s\n", e.what());
         return 1;

@@ -13,6 +13,13 @@ The same source path accepts `qwen35moe` GGUFs without `nextn_predict_layers` (z
 routed experts use CUDA/HIP MMQ; in hybrid mode, MMQ-only layers have no resident native slots and are streamed through
 MMQ for decode-sized batches. This compatibility is implemented in the fork branch and has not been measured on a GPU.
 
+The fork also accepts an MTP-only GGUF with `--mtp-gguf`. For Ornith, use
+[`SizorCloud/Ornith-1.5-122B-MTP`](https://huggingface.co/SizorCloud/Ornith-1.5-122B-MTP)'s
+`mtp-Ornith-1.5-122B-Q8_0.gguf` alongside the base GSQ-RCO file, then set `--mtp 2` (or another value from 1 to 7)
+to enable verified speculative drafts. The external file is mapped separately and its geometry is checked against the
+base model; the base GGUF remains unchanged. The published head reports 38% draft acceptance and 8.2 tok/s on a
+local RTX 3090 build at 2 drafts, but this fork's profile is still calibration-pending on this workstation.
+
 ## Quick start
 
 Pick it in the app's model list, in `strata launch` or in setup:
