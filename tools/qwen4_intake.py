@@ -142,7 +142,7 @@ QWEN35_REQUIRED = [
     "block_count", "embedding_length", "attention.head_count", "attention.head_count_kv", "attention.key_length",
     "attention.value_length", "expert_count", "expert_used_count", "expert_feed_forward_length",
     "expert_shared_feed_forward_length", "ssm.conv_kernel", "ssm.state_size", "ssm.group_count", "ssm.time_step_rank",
-    "ssm.inner_size", "full_attention_interval", "nextn_predict_layers",
+    "ssm.inner_size", "full_attention_interval",
 ]
 # src/qwen35/q36_engine.cu load(): "a geometry this driver's kernels do not take"
 QWEN35_LIMITS = [("attention.key_length", "head_dim", "==", 256), ("ssm.state_size", "ssm_state_size", "==", 128),
@@ -232,9 +232,17 @@ def geometry_qwen35(md: dict, arch: str, ntokens: int | None) -> tuple[Geometry,
         elif not _num(v):
             problems.append(p + k + " is not a number")
     g = Geometry(family="qwen35moe")
+    mtp_v = md.get(p + "nextn_predict_layers")
+    if mtp_v is None:
+        mtp = 0
+    elif not isinstance(mtp_v, int) or isinstance(mtp_v, bool) or mtp_v < 0:
+        problems.append(p + "nextn_predict_layers is not a non-negative integer")
+        mtp = 0
+    else:
+        mtp = int(mtp_v)
     if problems:
         return g, problems
-    mtp, nl = int(md[p + "nextn_predict_layers"]), int(md[p + "block_count"])
+    nl = int(md[p + "block_count"])
     if mtp >= nl:
         problems.append(p + "nextn_predict_layers is not smaller than " + p + "block_count")
     if int(md[p + "full_attention_interval"]) < 2:
@@ -370,6 +378,10 @@ def check_layout(tensors: dict[str, list[int]], g: Geometry, complete: bool) -> 
 TYPE_NAME = G.GGML_TYPES
 SMALL_OK = {0, 1, 30}            # F32, F16, BF16: norms, router, biases, the SSM vectors (q36_engine.cu f32(): F32 / BF16 / F16 / Q8_0)
 MMVQ = {2, 6, 7, 8, 11, 12, 13, 14, 20, 23, 42, 16, 17, 18, 21, 22, 29}        # native_mmvq_supported(): CUDA, SYCL and Metal host copy
+# src/prefill/moe_mmq.cu: the always-built MMQ instances.  K-quants are added below when
+# STRATA_MMQ_KQUANTS is enabled (the default CMake option and the q36 engine's runtime mode).
+MMQ_BASE = {42, 16, 17, 22, 18, 21, 20, 23, 8}                                  # Q2_0, IQ2/IQ3/IQ4, Q8_0
+MMQ_KQUANTS = {12, 13, 7, 14}                                                     # Q4_K, Q5_K, Q5_1, Q6_K
 BACKEND_LISTS = {
     # src/kernels/cuda/iq_kernels.cu: STRATA_GU_FMTS / STRATA_D_FMTS (STRATA_Q6K_EXPERTS=ON, the default) and is_iq().  The HIP
     # build compiles this same file: AMD gfx11 / gfx12 / gfx1151 differ in kernel modes and speed, not in this list.
@@ -413,6 +425,21 @@ def expert_pair_ok(be: str, gu: int, down: int, n_embd: int, n_ff: int) -> bool:
     qd = block_elems(down) if down in L["down"] else 0
     return bool(qg > 0 and qd > 0 and gu in L["is_iq"] and down in L["is_iq"] and n_embd % qg == 0 and n_ff % qd == 0 and
                 n_embd % 256 == 0 and (n_ff * n_embd) % 256 == 0)
+
+
+def mmq_expert_pair_ok(be: str, gu: int, down: int, n_embd: int, n_ff: int) -> bool:
+    """Whether Strata's CUDA/HIP MMQ fallback can multiply this routed expert pair.
+
+    MMQ covers the same IQ/K-quant matrix types as the backend's native MMVQ list; unlike
+    native_expert_supported(), it does not require the down projection to be in the native
+    grouped down-format list.  The dimensions still have to form whole quantization blocks.
+    """
+    if be not in ("cuda", "hip"):
+        return False
+    L = BACKEND_LISTS[be]
+    supported = MMQ_BASE | MMQ_KQUANTS
+    qg, qd = block_elems(gu), block_elems(down)
+    return bool(gu in supported and down in supported and qg > 0 and qd > 0 and n_embd % qg == 0 and n_ff % qd == 0)
 
 
 ROLE_PATTERNS = [
@@ -501,9 +528,9 @@ def analyse_quants(tensors: list[tuple[str, list[int], int]], g: Geometry | None
                 if gt != ut:
                     bad.append({"tensor": "blk.%d.ffn_gate_exps / ffn_up_exps" % l, "type": type_name(gt) + "/" + type_name(ut),
                                 "role": "routed", "why": "gate and up differ in type"})
-                elif not expert_pair_ok(be, gt, dt, g.n_embd, g.n_ff):
+                elif not expert_pair_ok(be, gt, dt, g.n_embd, g.n_ff) and not (qwen35 and mmq_expert_pair_ok(be, gt, dt, g.n_embd, g.n_ff)):
                     bad.append({"tensor": "blk.%d.ffn_*_exps" % l, "type": "%s/%s" % (type_name(gt), type_name(dt)), "role": "routed",
-                                "why": "no expert kernel for this gate+up / down pair at n_embd %d, n_ff %d (native_expert_supported)"
+                                "why": "no native expert or MMQ kernel for this gate+up / down pair at n_embd %d, n_ff %d"
                                        % (g.n_embd, g.n_ff)})
         # group the identical complaints
         grouped: dict[tuple, dict] = {}

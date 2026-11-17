@@ -8,6 +8,11 @@ Strata runs [Unsloth's GGUFs with the MTP layer](https://huggingface.co/unsloth/
 (UD-Q4_K_XL, UD-Q6_K_XL, Q8_0) on its own engine path (`src/qwen35`; `strata` switches to it from the file's
 architecture). It runs on NVIDIA and AMD cards. The Intel Arc and Mac engines do not run it.
 
+The same source path accepts `qwen35moe` GGUFs without `nextn_predict_layers` (zero MTP layers), including the
+[Ornith 1.5 122B GSQ-RCO IQ3_S export](https://huggingface.co/fajardc/Ornith-1.5-122B-GSQ-RCO-GGUF). Its mixed IQ2/IQ3
+routed experts use CUDA/HIP MMQ; in hybrid mode, MMQ-only layers have no resident native slots and are streamed through
+MMQ for decode-sized batches. This compatibility is implemented in the fork branch and has not been measured on a GPU.
+
 ## Quick start
 
 Pick it in the app's model list, in `strata launch` or in setup:

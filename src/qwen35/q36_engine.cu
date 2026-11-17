@@ -856,6 +856,9 @@ struct Layer {
     Mat sh_gate, sh_up, sh_down;
     const float* sh_gate_inp = nullptr;   // [N]
     K::NativeExpertLayout L;
+    // Native grouped decode supports only a subset of the GGUF expert pairs.  MMQ can read
+    // the remaining IQ/K-quant pairs (notably Ornith's IQ2/IQ3 down projections).
+    bool native_grouped = true;
     uint8_t* blobs = nullptr;   // n_expert blobs, `stride` bytes apart (L.bytes rounded up to whole blocks of every
     size_t stride = 0;          // part's type, so MMQ can step over them by blocks), then kMmqTail zero bytes
                                 // (hybrid mode: n_slots slots, see place_experts)
@@ -1080,11 +1083,16 @@ bool load(const std::string& path, Model& m, std::string& err, bool want_mtp) {
             err = L(l, "ffn_gate_exps / ffn_up_exps differ in type");
             return false;
         }
-        if (!K::native_expert_supported((int) tg->type, (int) td->type, g.n_embd, g.n_ff)) {
-            err = L(l, "experts are ") + tg->type_name() + "/" + td->type_name() + ", which the native expert kernels " +
-                  "do not take (build with -DSTRATA_Q6K_EXPERTS=ON for Q6_K)";
+        const bool native_ok = K::native_expert_supported((int) tg->type, (int) td->type, g.n_embd, g.n_ff);
+        const bool mmq_ok = MMQ::built() && std::getenv("STRATA_Q36_NO_MMQ") == nullptr &&
+                            MMQ::supported((int) tg->type) && MMQ::supported((int) td->type) &&
+                            MMQ::fits((int) tg->type, 2 * g.n_ff) && MMQ::fits((int) td->type, g.n_embd);
+        if (!native_ok && !mmq_ok) {
+            err = L(l, "experts are ") + tg->type_name() + "/" + td->type_name() +
+                  ", which neither the native grouped nor the MMQ expert kernels take";
             return false;
         }
+        y.native_grouped = native_ok;
         y.L = K::native_expert_layout((int) tg->type, (int) td->type, g.n_embd, g.n_ff);
         const size_t gsz = (size_t) g.n_ff * y.L.gu_row, dsz = (size_t) g.n_embd * y.L.d_row;
         // a stride in whole blocks of both parts' types (MMQ steps over the experts by blocks), 16-byte aligned
@@ -2120,16 +2128,21 @@ struct Engine {
         else f32mm(L.router, h, logits_r, N, (int) g.n_expert, T);
         // the hybrid rows path: a batch of up to hybrid_t rows; when only the MTP block is hybrid, its every batch
         // (its prompt pass too: no staging buffers then)
-        const bool hy_rows = lhy(li) && (T <= hybrid_t || !main_hybrid);
+        const bool hy_rows = lhy(li) && L.native_grouped && (T <= hybrid_t || !main_hybrid);
+        // MMQ-only expert pairs (for example Ornith's IQ2/IQ3 down tensors) also need
+        // the MMQ route for decode-sized batches; route_group is only valid for native blobs.
+        const bool mmq_small = !hy_rows && T <= kGemmT && use_mmq && !L.native_grouped;
         const bool mmq_rows = !hy_rows && T > kGemmT && use_pf;
-        if (!(!mmq_rows && route_group(L, hy_rows ? hy[li].slot_of_d : nullptr, T, ext ? (int) g.n_expert + 1 : (int) g.n_expert)))
+        if (!(!mmq_rows && !mmq_small && route_group(L, hy_rows ? hy[li].slot_of_d : nullptr, T,
+                                                       ext ? (int) g.n_expert + 1 : (int) g.n_expert)))
             K::native_router_topk(logits_r, ids, ewts, (int) g.n_expert, Kp, T, st);
         const int64_t n_ent = (int64_t) T * Kp;
         const int32_t* prow = nullptr;
         if (hy_rows) {
             moe_hybrid_gpu(L, li, T);
-        } else if (T > kGemmT && use_pf) {
-            // a prompt chunk: each expert's weights read once for all its rows, on Strata's fused int8 kernels where they
+        } else if ((T > kGemmT && use_pf) || mmq_small) {
+            // a prompt chunk, or a decode-sized batch for an MMQ-only pair: each expert's weights read once for all
+            // its rows, on Strata's fused int8 kernels where they
             // cover the layer (fused_on), else on llama.cpp's MMQ.  In the hybrid mode the layer's experts come streamed
             // (stream_take); the routing counts feed the slots' scores there
             const int ne = (int) g.n_expert;
@@ -3060,8 +3073,9 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         const size_t Tn = (size_t) E.tmax, Nn = (size_t) g.n_embd, Kn = (size_t) m.top_k;
         size_t need = staging + Tn * Kn * Nn * 4 + Tn * Kn * 4;
         for (Layer* L : all) {
+            const int layer_slots = L->native_grouped ? S : 0;
             if (mtp_only && L != &m.mtp) need += L->stride * (size_t) ne + kMmqTail;
-            else need += (S > 0 ? (size_t) S * L->stride + kMmqTail : 0);
+            else need += (layer_slots > 0 ? (size_t) layer_slots * L->stride + kMmqTail : 0);
         }
         if (need > fr) {
             err = "not enough VRAM left for the hybrid experts' buffers and slots (" + std::to_string((need >> 20)) +
@@ -3104,16 +3118,20 @@ bool place_experts(Model& m, Engine& E, double vram_gib, int threads, int hybrid
         off += L.stride * (size_t) ne + kMmqTail;
         std::memset(L.hblobs, 0, L.stride * (size_t) ne + kMmqTail);
         for (int64_t e = 0; e < ne; ++e) expert_blob(L, e, L.hblobs + (size_t) e * L.stride);
-        L.n_slots = S;
-        if (S > 0) {
-            CK(cudaMalloc(&L.blobs, L.stride * (size_t) S + kMmqTail));
-            CK(cudaMemset(L.blobs, 0, L.stride * (size_t) S + kMmqTail));
-            CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) S, cudaMemcpyHostToDevice));
+        // A layer whose pair is MMQ-only cannot run the resident-slot decode path (that path
+        // uses native_expert_grouped).  Leave its experts in the CPU pool; large prompt chunks
+        // still stream the whole layer through MMQ, while native layers keep their GPU slots.
+        const int layer_slots = L.native_grouped ? S : 0;
+        L.n_slots = layer_slots;
+        if (layer_slots > 0) {
+            CK(cudaMalloc(&L.blobs, L.stride * (size_t) layer_slots + kMmqTail));
+            CK(cudaMemset(L.blobs, 0, L.stride * (size_t) layer_slots + kMmqTail));
+            CK(cudaMemcpy(L.blobs, L.hblobs, L.stride * (size_t) layer_slots, cudaMemcpyHostToDevice));
         }
         Engine::Hy& H = E.hy[li];
         H.slot_of.assign((size_t) ne, -1);
-        H.exp_in_slot.assign((size_t) S, 0);
-        for (int s = 0; s < S; ++s) {
+        H.exp_in_slot.assign((size_t) layer_slots, 0);
+        for (int s = 0; s < layer_slots; ++s) {
             H.slot_of[(size_t) s] = s;
             H.exp_in_slot[(size_t) s] = s;
         }

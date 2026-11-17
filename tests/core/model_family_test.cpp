@@ -56,7 +56,7 @@ const Dims kFlashNext = {48, 2560, 24, 2, 256, 512, 10, 640, 640, 4, 128, 16, 48
 const Dims kTiny36 = {5, 64, 2, 1, 16, 4, 2, 32, 32, 4, 8, 2, 4, 32, 4, 1, 0, 0, 0, 0};
 const Dims kTinyFlash = {8, 64, 2, 1, 16, 4, 2, 32, 32, 4, 8, 2, 4, 32, 4, 0, 2, 8, 2, 8};
 
-std::vector<Kv> metadata(const char* arch, const Dims& d, uint64_t vocab) {
+std::vector<Kv> metadata(const char* arch, const Dims& d, uint64_t vocab, bool include_mtp = true) {
     const std::string p = std::string(arch) + ".";
     std::vector<Kv> kv = {fixture::str("general.architecture", arch),
                           fixture::u32(p + "block_count", d.block_count),
@@ -76,7 +76,7 @@ std::vector<Kv> metadata(const char* arch, const Dims& d, uint64_t vocab) {
                           fixture::u32(p + "ssm.inner_size", d.inner),
                           fixture::u32(p + "full_attention_interval", d.interval)};
     if (std::string(arch) == "qwen35moe") {
-        kv.push_back(fixture::u32(p + "nextn_predict_layers", d.nextn));
+        if (include_mtp) kv.push_back(fixture::u32(p + "nextn_predict_layers", d.nextn));
     } else {
         kv.push_back(fixture::u32(p + "hyper_connection.count", d.hc));
         kv.push_back(fixture::u32(p + "hyper_connection.low_rank", d.hc_lr));
@@ -229,6 +229,18 @@ int main(int argc, char** argv) {
         check(ok, "Qwen3.6 geometry reads" + (ok ? std::string() : ": " + err));
         check(g.family == strata::ModelFamily::Qwen35Moe && g.n_layers == 40 && g.n_mtp_layers == 1 && g.n_embd == 2048,
               "Qwen3.6: 40 trunk layers + 1 MTP block, hidden 2048");
+        Dims ornith = kQwen36;
+        ornith.block_count = 40;
+        ornith.nextn = 0;
+        const fs::path ornith_meta = d.path / "ornith-meta.gguf";
+        fixture::write(ornith_meta, metadata("qwen35moe", ornith, 8, false), {});
+        strata::core::ModelGeometry ornith_g;
+        int64_t ornith_k = 0;
+        std::string ornith_err;
+        const strata::GgufFile ornith_f(ornith_meta.string());
+        check(strata::check_architecture(ornith_f).empty(), "qwen35moe without nextn_predict_layers passes the architecture guard");
+        check(geometry_of(ornith_meta, ornith_g, ornith_k, ornith_err) && ornith_g.n_layers == 40 && ornith_g.n_mtp_layers == 0,
+              "a qwen35moe file without nextn_predict_layers has zero MTP layers");
         check(g.n_qsa_layers() == 10 && g.n_gdn_layers() == 30 && strata::core::layer_kind(g, 3) ==
                   strata::core::LayerKind::Attention && strata::core::layer_kind(g, 40) == strata::core::LayerKind::Mtp,
               "Qwen3.6: 10 attention / 30 GDN layers, layer 40 is the MTP block");

@@ -510,7 +510,9 @@ class TablesMatchTheSources(unittest.TestCase):
         self.assertIn("g.head_dim != 256 || g.ssm_state_size != 128 || g.ssm_d_conv != 4 || g.n_expert > 512 || m.top_k > 15", text)
         hpp = _read("include/strata/artifact/gguf_reader.hpp")
         body = _func(hpp, "inline std::string check_architecture_qwen35moe")
-        self.assertEqual(set(re.findall(r'"qwen35moe\.([a-z_.]+)"', body)), set(Q.QWEN35_REQUIRED))
+        keys = set(re.findall(r'"qwen35moe\.([a-z_.]+)"', body))
+        self.assertEqual(keys - {"nextn_predict_layers"}, set(Q.QWEN35_REQUIRED))
+        self.assertIn("nextn_predict_layers", keys)  # optional for no-MTP qwen35moe files
 
     def test_qwen4_geometry_keys(self):
         hpp = _read("include/strata/artifact/gguf_reader.hpp")
@@ -560,6 +562,20 @@ class TablesMatchTheSources(unittest.TestCase):
             for t in L["gu"] | L["down"]:
                 with self.subTest((be, t)):
                     self.assertGreater(Q.block_elems(t), 0)
+
+    def test_qwen35_no_mtp_defaults_to_zero_and_ornith_pairs_use_mmq(self):
+        md = copy.deepcopy(load_fixture("q36_q8_0")["files"][0]["metadata"])
+        md.pop("qwen35moe.nextn_predict_layers", None)
+        md["qwen35moe.block_count"] = 40
+        g, problems = Q.geometry_qwen35(md, "qwen35moe", None)
+        self.assertEqual(problems, [])
+        self.assertEqual((g.n_layers, g.n_mtp_layers), (40, 0))
+        # Ornith's low-bit down projections are outside native_expert_supported(), but CUDA/HIP MMQ covers them.
+        self.assertTrue(Q.mmq_expert_pair_ok("cuda", 16, 16, 3072, 1024))
+        self.assertTrue(Q.mmq_expert_pair_ok("hip", 18, 20, 3072, 1024))
+        self.assertTrue(Q.mmq_expert_pair_ok("cuda", 12, 12, 3072, 1024))  # Q4_K via STRATA_MMQ_KQUANTS
+        self.assertFalse(Q.mmq_expert_pair_ok("cuda", 2, 2, 3072, 1024))   # Q4_0 has no moe_mmq instance
+        self.assertFalse(Q.mmq_expert_pair_ok("sycl", 16, 16, 3072, 1024))
 
     def test_expert_pair_rule_matches_the_cuda_function(self):
         iq = _read("src/kernels/cuda/iq_kernels.cu")
